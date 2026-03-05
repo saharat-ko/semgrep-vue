@@ -1,11 +1,7 @@
 name: Semgrep Vue3 Version Scanner
 
 on:
-  workflow_dispatch:        # รันมือได้จาก GitHub UI
-  push:
-    branches: [main]
-  schedule:
-    - cron: '0 2 * * 1'    # รันทุกจันทร์ตี 2 (optional)
+  workflow_dispatch:
 
 jobs:
   semgrep-scan:
@@ -34,31 +30,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: semgrep-results
-          path: results/          # อัพ JSON ทุกไฟล์ + CSV + HTML
+          path: results/
 
       - name: Show Summary in Job log
         run: python scripts/generate_report.py
-```
-
----
-
-### 🔄 Step 5: Flow ทั้งหมด
-```
-Push to main / Manual trigger
-        ↓
-GitHub Actions starts
-        ↓
-Install Semgrep
-        ↓
-Clone vuejs/core + fetch --tags
-        ↓
-Loop ทุก version:
-  checkout tag → semgrep scan → save JSON
-        ↓
-generate_report.py:
-  JSON → CSV (summary.csv)
-  JSON → HTML (report.html)
-  Print summary ใน logs
-        ↓
-Upload ทุกไฟล์เป็น GitHub Artifact
-(ดาวน์โหลดได้จาก Actions tab)
