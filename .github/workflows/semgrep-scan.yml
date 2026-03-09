@@ -2,35 +2,402 @@ name: Semgrep Vue3 Version Scanner
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   semgrep-scan:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 120
+
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      # =============================================
+      # แก้ตรงนี้! ใส่ versions ที่ตัวเองรับผิดชอบ
+      # คน 1: "v3.0.0 v3.0.8 v3.0.6 v3.0.4"
+      # คน 2: "v3.1.0 v3.1.5 v3.1.3 v3.1.2"
+      # คน 3: "v3.2.0 v3.2.42 v3.2.46 v3.2.34"
+      # คน 4: "v3.3.0 v3.3.9 v3.3.5 v3.3.7"
+      # คน 5: "v3.4.0 v3.4.28 v3.4.22 v3.4.32"
+      # คน 6: "v3.5.0 v3.5.14 v3.5.15 v3.5.13"
+      # =============================================
+      VERSIONS: "v3.1.0 v3.1.5 v3.1.3 v3.1.2"
+
     steps:
-      - name: Checkout your project repo
+      # ===================================================
+      # STEP 1: Checkout your project repo (ไม่ใช่ Vue)
+      # ===================================================
+      - name: Checkout project repo
         uses: actions/checkout@v4
 
+      # ===================================================
+      # STEP 2: Clone vuejs/core + fetch tags
+      # ===================================================
+      - name: Clone Vue.js core
+        run: |
+          git clone https://github.com/vuejs/core.git --no-single-branch vue-core
+          cd vue-core
+          git fetch --tags
+          echo "Tags fetched:"
+          git tag -l "v3.*" | grep -E "^v3\.[0-9]+\.[0-9]+$" | sort -V | tail -10
+
+      # ===================================================
+      # STEP 3: Install tools
+      # ===================================================
       - name: Install Semgrep
         run: pip install semgrep
 
-      - name: Install Python deps
-        run: pip install glob2
+      - name: Install Semgrep Pro Engine
+        run: semgrep install-semgrep-pro
 
-      - name: Make script executable
-        run: chmod +x scripts/scan_versions.sh
+      - name: Install cloc
+        run: sudo apt-get install -y cloc
 
-      - name: Run Semgrep on all Vue3 versions
-        run: bash scripts/scan_versions.sh
+      # ===================================================
+      # STEP 4: SAST Scan แต่ละ version (semgrep scan)
+      # ===================================================
+      - name: Run SAST scan
+        run: |
+          mkdir -p results
+          cd vue-core
 
-      - name: Generate CSV + HTML Report
-        run: python scripts/generate_report.py
+          TOTAL=$(echo $VERSIONS | wc -w)
+          COUNT=0
 
-      - name: Upload all results as Artifacts
+          for VERSION in $VERSIONS; do
+            COUNT=$((COUNT + 1))
+            echo ""
+            echo "==============================="
+            echo "[$COUNT/$TOTAL] SAST Scanning $VERSION..."
+            echo "==============================="
+
+            git checkout "tags/$VERSION" -f 2>/dev/null || {
+              echo "Tag $VERSION not found, skipping..."
+              continue
+            }
+
+            SAST_FILE="../results/${VERSION}_sast.json"
+
+            semgrep scan \
+              --config "p/default" \
+              --config "p/javascript" \
+              --config "p/typescript" \
+              --config "p/security-audit" \
+              --config "p/owasp-top-ten" \
+              --exclude="*__tests__*" \
+              --exclude="*__mocks__*" \
+              --exclude="*examples*" \
+              --exclude="*size-check*" \
+              --exclude="*template-explorer*" \
+              --exclude="*runtime-test*" \
+              --include="*.ts" \
+              --include="*.js" \
+              --include="*.vue" \
+              --json \
+              --output "$SAST_FILE" || true
+
+            SAST_COUNT=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('$SAST_FILE'))
+            print(len(d.get('results', [])))
+          except:
+            print('?')
+          ")
+            echo "SAST: $VERSION -> $SAST_COUNT findings"
+          done
+
+      # ===================================================
+      # STEP 5: SCA Scan แต่ละ version (semgrep ci)
+      # ===================================================
+      - name: Run SCA scan (Supply Chain / CVE)
+        run: |
+          cd vue-core
+
+          TOTAL=$(echo $VERSIONS | wc -w)
+          COUNT=0
+
+          for VERSION in $VERSIONS; do
+            COUNT=$((COUNT + 1))
+            echo ""
+            echo "==============================="
+            echo "[$COUNT/$TOTAL] SCA Scanning $VERSION..."
+            echo "==============================="
+
+            git checkout "tags/$VERSION" -f 2>/dev/null || {
+              echo "Tag $VERSION not found, skipping..."
+              continue
+            }
+
+            SCA_FILE="../results/${VERSION}_sca.json"
+
+            SEMGREP_BRANCH="release/$VERSION" \
+            SEMGREP_REPO_NAME="vuejs/core" \
+            SEMGREP_COMMIT="$VERSION" \
+            semgrep ci \
+              --supply-chain \
+              --exclude="*__tests__*" \
+              --exclude="*__mocks__*" \
+              --exclude="*examples*" \
+              --exclude="*size-check*" \
+              --exclude="*template-explorer*" \
+              --exclude="*runtime-test*" \
+              --json \
+              --output "$SCA_FILE" || true
+
+            SCA_COUNT=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('$SCA_FILE'))
+            results = d.get('results', [])
+            cve_list = [r for r in results if r.get('extra',{}).get('metadata',{}).get('cve','')]
+            print(f'total={len(results)} cve={len(cve_list)}')
+          except:
+            print('?')
+          ")
+            echo "SCA: $VERSION -> $SCA_COUNT"
+          done
+
+      # ===================================================
+      # STEP 6: Count LOC with cloc
+      # ===================================================
+      - name: Count LOC per version
+        run: |
+          cd vue-core
+
+          echo "{" > ../results/loc_summary.json
+          FIRST=true
+
+          for VERSION in $VERSIONS; do
+            git checkout "tags/$VERSION" -f 2>/dev/null || {
+              echo "Tag $VERSION not found, skipping LOC count..."
+              continue
+            }
+
+            cloc packages/ \
+              --exclude-dir=__tests__,__mocks__,examples,size-check,template-explorer,runtime-test \
+              --include-lang=TypeScript,JavaScript \
+              --json \
+              --out=/tmp/cloc_tmp.json 2>/dev/null || true
+
+            TS=$(python3 -c "import json; d=json.load(open('/tmp/cloc_tmp.json')); print(d.get('TypeScript',{}).get('code',0))" 2>/dev/null || echo 0)
+            JS=$(python3 -c "import json; d=json.load(open('/tmp/cloc_tmp.json')); print(d.get('JavaScript',{}).get('code',0))" 2>/dev/null || echo 0)
+            TOTAL=$((TS + JS))
+
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              echo "," >> ../results/loc_summary.json
+            fi
+
+            echo "  \"$VERSION\": {\"TypeScript\": $TS, \"JavaScript\": $JS, \"total\": $TOTAL}" >> ../results/loc_summary.json
+            echo "LOC $VERSION: TS=$TS JS=$JS Total=$TOTAL"
+          done
+
+          echo "}" >> ../results/loc_summary.json
+
+      # ===================================================
+      # STEP 7: Generate summary
+      # ===================================================
+      - name: Generate summary
+        run: |
+          python3 -c "
+          import json, glob, os
+
+          loc_data = {}
+          try:
+            loc_data = json.load(open('results/loc_summary.json'))
+          except:
+            pass
+
+          print('\n=== SAST Summary ===')
+          print(f\"{'Version':<12} {'LOC':>8} {'Findings':>10} {'Density/1KLOC':>15}\")
+          print('-' * 50)
+
+          for f in sorted(glob.glob('results/v*_sast.json')):
+            version = os.path.basename(f).replace('_sast.json','')
+            try:
+              d = json.load(open(f))
+              findings = len(d.get('results', []))
+              loc = loc_data.get(version, {}).get('total', 0)
+              density = round((findings / loc) * 1000, 4) if loc > 0 else 0
+              print(f'{version:<12} {loc:>8,} {findings:>10} {density:>15.4f}')
+            except Exception as e:
+              print(f'{version:<12} error: {e}')
+
+          print('\n=== Supply Chain (CVE) Summary ===')
+          print(f\"{'Version':<12} {'SCA Total':>10} {'CVEs':>8}\")
+          print('-' * 35)
+
+          for f in sorted(glob.glob('results/v*_sca.json')):
+            version = os.path.basename(f).replace('_sca.json','')
+            try:
+              d = json.load(open(f))
+              results = d.get('results', [])
+              cve_list = [r for r in results if r.get('extra',{}).get('metadata',{}).get('cve','')]
+              print(f'{version:<12} {len(results):>10} {len(cve_list):>8}')
+            except Exception as e:
+              print(f'{version:<12} error: {e}')
+          "
+
+      # ===================================================
+      # STEP 8: Export CSV
+      # ===================================================
+      - name: Export CSV
+        if: always()
+        run: |
+          python3 << 'INNEREOF'
+          import json, glob, os, csv
+
+          RESULTS_DIR = "results"
+
+          def normalize_severity(raw):
+              s = raw.upper()
+              if s == "CRITICAL":            return "Critical"
+              if s in ("ERROR", "HIGH"):     return "High"
+              if s in ("WARNING", "MEDIUM"): return "Medium"
+              if s in ("INFO", "LOW"):       return "Low"
+              return "Low"
+
+          loc_data = {}
+          try:
+            with open(f"{RESULTS_DIR}/loc_summary.json") as f:
+              loc_data = json.load(f)
+          except:
+            print("Warning: loc_summary.json not found")
+
+          # --- SAST CSV ---
+          sast_rows = []
+          for f in sorted(glob.glob(f"{RESULTS_DIR}/v*_sast.json")):
+            version = os.path.basename(f).replace("_sast.json", "")
+            try:
+              d = json.load(open(f))
+              for r in d.get("results", []):
+                sast_rows.append({
+                  "version":  version,
+                  "rule_id":  r.get("check_id", ""),
+                  "severity": normalize_severity(r.get("extra", {}).get("severity", "")),
+                  "file":     r.get("path", ""),
+                  "line":     r.get("start", {}).get("line", ""),
+                  "message":  r.get("extra", {}).get("message", "")[:200],
+                })
+            except Exception as e:
+              print(f"Error {f}: {e}")
+
+          with open(f"{RESULTS_DIR}/sast_findings.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["version","rule_id","severity","file","line","message"])
+            w.writeheader()
+            w.writerows(sast_rows)
+          print(f"SAST: {len(sast_rows)} findings -> sast_findings.csv")
+
+          # --- SCA CSV ---
+          sca_rows = []
+          for f in sorted(glob.glob(f"{RESULTS_DIR}/v*_sca.json")):
+            version = os.path.basename(f).replace("_sca.json", "")
+            try:
+              d = json.load(open(f))
+              for r in d.get("results", []):
+                meta = r.get("extra", {}).get("metadata", {})
+                sca_rows.append({
+                  "version":          version,
+                  "cve":              meta.get("cve", ""),
+                  "severity":         normalize_severity(r.get("extra", {}).get("severity", "")),
+                  "package":          meta.get("package", ""),
+                  "version_affected": meta.get("vulnerable_versions", ""),
+                  "file":             r.get("path", ""),
+                  "line":             r.get("start", {}).get("line", ""),
+                  "message":          r.get("extra", {}).get("message", "")[:200],
+                })
+            except Exception as e:
+              print(f"Error {f}: {e}")
+
+          with open(f"{RESULTS_DIR}/sca_findings.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["version","cve","severity","package","version_affected","file","line","message"])
+            w.writeheader()
+            w.writerows(sca_rows)
+          print(f"SCA:  {len(sca_rows)} findings -> sca_findings.csv")
+
+          # --- Summary CSV ---
+          summary_rows = []
+          versions = set()
+          for f in glob.glob(f"{RESULTS_DIR}/v*_sast.json"):
+            versions.add(os.path.basename(f).replace("_sast.json",""))
+
+          for version in sorted(versions):
+            sast_crit = sast_high = sast_med = sast_low = 0
+            sca_total = cve_count = sca_crit = sca_high = sca_med = sca_low = 0
+
+            try:
+              d = json.load(open(f"{RESULTS_DIR}/{version}_sast.json"))
+              for r in d.get("results", []):
+                s = normalize_severity(r.get("extra",{}).get("severity",""))
+                if s == "Critical":   sast_crit += 1
+                elif s == "High":     sast_high += 1
+                elif s == "Medium":   sast_med  += 1
+                else:                 sast_low  += 1
+            except: pass
+
+            try:
+              d = json.load(open(f"{RESULTS_DIR}/{version}_sca.json"))
+              results = d.get("results", [])
+              sca_total = len(results)
+              cve_count = len([r for r in results if r.get("extra",{}).get("metadata",{}).get("cve","")])
+              for r in results:
+                s = normalize_severity(r.get("extra",{}).get("severity",""))
+                if s == "Critical":   sca_crit += 1
+                elif s == "High":     sca_high += 1
+                elif s == "Medium":   sca_med  += 1
+                else:                 sca_low  += 1
+            except: pass
+
+            loc = loc_data.get(version, {}).get("total", 0)
+            sast_total = sast_crit + sast_high + sast_med + sast_low
+            density = round((sast_total / loc) * 1000, 4) if loc > 0 else 0
+
+            summary_rows.append({
+              "version":           version,
+              "loc_total":         loc,
+              "loc_typescript":    loc_data.get(version, {}).get("TypeScript", 0),
+              "loc_javascript":    loc_data.get(version, {}).get("JavaScript", 0),
+              "sast_total":        sast_total,
+              "sast_critical":     sast_crit,
+              "sast_high":         sast_high,
+              "sast_medium":       sast_med,
+              "sast_low":          sast_low,
+              "density_per_1kloc": density,
+              "sca_total":         sca_total,
+              "sca_critical":      sca_crit,
+              "sca_high":          sca_high,
+              "sca_medium":        sca_med,
+              "sca_low":           sca_low,
+              "cve_count":         cve_count,
+            })
+
+          with open(f"{RESULTS_DIR}/summary.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[
+              "version","loc_total","loc_typescript","loc_javascript",
+              "sast_total","sast_critical","sast_high","sast_medium","sast_low","density_per_1kloc",
+              "sca_total","sca_critical","sca_high","sca_medium","sca_low","cve_count"
+            ])
+            w.writeheader()
+            w.writerows(summary_rows)
+          print(f"Summary: {len(summary_rows)} versions -> summary.csv")
+
+          print()
+          print(f"{'Version':<12} {'LOC':>8} {'S_CRIT':>7} {'S_HIGH':>7} {'S_MED':>7} {'S_LOW':>7} {'Density':>10} {'SC_CRIT':>8} {'SC_HIGH':>8} {'SC_MED':>8} {'SC_LOW':>8} {'CVEs':>6}")
+          print("-" * 105)
+          for r in summary_rows:
+            print(f"{r['version']:<12} {r['loc_total']:>8,} {r['sast_critical']:>7} {r['sast_high']:>7} {r['sast_medium']:>7} {r['sast_low']:>7} {r['density_per_1kloc']:>10.4f} {r['sca_critical']:>8} {r['sca_high']:>8} {r['sca_medium']:>8} {r['sca_low']:>8} {r['cve_count']:>6}")
+          INNEREOF
+
+      # ===================================================
+      # STEP 9: Upload results as Artifacts
+      # ===================================================
+      - name: Upload scan results
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: semgrep-results
+          name: semgrep-results-${{ github.actor }}
           path: results/
-
-      - name: Show Summary in Job log
-        run: python scripts/generate_report.py
+          retention-days: 30
